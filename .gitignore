@@ -1,2 +1,843 @@
 .sass-cache/
 *.css.map
+
+/*账户表*/
+data account;
+set hive.tmp_account_new;
+run;
+/*去重*/
+proc sort data=account;by borrow_nid type bank card descending createtime descending updatetime;run;
+proc sort data=account out=account_unique nodupkey;by borrow_nid type bank card;run;
+/*(where=(fushu_cre_time<=add_time))*/
+/*proc sort data=account out=a nouniquekey;by borrow_nid loginaccount type bank card;run;*/
+proc freq data=account_unique;tables dt;run;
+/*卡类变量:非共享信用卡数,借记卡数,信用卡数*/
+data card_var;
+set account_unique;
+by borrow_nid type bank;
+retain Non_shared_credit_card_num credit_card_num debit_card_num Non_shared_flag;
+if first.borrow_nid then do;
+	credit_card_num=0;
+	debit_card_num=0;
+	Non_shared_credit_card_num=0;
+end;
+if type="储蓄卡" then debit_card_num+1;
+if type="信用卡" then credit_card_num+1;
+if first.bank then Non_shared_flag=0;
+if type="信用卡" then Non_shared_flag=1;
+if last.bank and Non_shared_flag=1 then Non_shared_credit_card_num+1;
+if last.borrow_nid;
+run;
+proc freq data=card_var;tables Non_shared_credit_card_num credit_card_num debit_card_num;run;
+/*额度表*/
+data limits;
+set hive.tmp_lp_fushu_limits_new_unique;
+run;
+/*去重*/
+/*proc sort data=limits out=a nouniquekey;by borrow_nid loginaccount account_id;run;*/
+/*proc sort data=limits;by borrow_nid loginaccount account_id descending dt;run;*/
+/*proc sort data=limits(where=(currency="人民币")) out=limits_unique nodupkey;by borrow_nid loginaccount account_id;run;*/
+proc sort data=account_unique;by borrow_nid type card;run;
+proc sort data=limits;by borrow_nid type card;run;
+data limit_base;
+merge limits(in=a) account_unique(keep=borrow_nid loginaccount id type bank card rename=(id=account_id) in=b);
+by borrow_nid type card;
+if a and b;
+run;
+proc sort data=limit_base;by borrow_nid type bank card;run;
+/*额度类变量:最大额度,总额度,最小额度*/
+data limit_var;
+set limit_base;
+where type="信用卡";
+by borrow_nid type bank;
+retain Non_shared_limit_max credit_limit_max credit_limit_total credit_limit_min;
+if first.borrow_nid then do;
+	Non_shared_limit_max=.;
+	credit_limit_max=.;
+	credit_limit_total=.;
+	credit_limit_min=.;
+end;
+if first.bank then 	Non_shared_limit_max=.;
+if compress(consume_limit)="" then do;
+	if compress(usable_consume_limit)="" then limit=compress(usable_consume_limit)+0;
+	else if compress(cash_limit)="" then limit=compress(cash_limit)+0;
+	else if compress(usable_cash_limit)="" then limit=compress(usable_cash_limit)+0;
+end;
+else limit=compress(consume_limit)+0;
+Non_shared_limit_max=max(Non_shared_limit_max,limit);
+credit_limit_max=max(credit_limit_max,limit);
+credit_limit_min=min(credit_limit_min,limit);
+if last.bank then credit_limit_total=sum(credit_limit_total,Non_shared_limit_max);
+if last.borrow_nid;
+run;
+/*账单表*/
+data bills;
+set hive.tmp_lp_fushu_bill_new_unique;
+run;
+/*data bills1;*/
+/*set hive.tmp_lp_fushu_bill_new;*/
+/*run;*/
+/*去重*/
+/*proc sort data=bills out=a nouniquekey;by borrow_nid loginaccount account_id bill_date;run;*/
+/*proc sort data=bills;by borrow_nid loginaccount account_id bill_date descending dt;run;*/
+/*proc sort data=bills(where=(bill_date^="" and intck("day",input(compress(bill_date),yymmdd10.)*/
+/*,input(compress(substr(verify_time,1,10)),yymmdd10.))>=0)) */
+/*out=bills_unique nodupkey;by borrow_nid loginaccount account_id bill_date;run;*/
+proc sort data=bills;by borrow_nid type card;run;
+proc sort data=bills out=a nouniquekey;by borrow_nid type card bill_date;run;
+proc sort data=account_unique;by borrow_nid type card;run;
+proc sort data=limit_base;by borrow_nid type card;run;
+data bills_base;
+merge bills(in=a) account_unique(keep=borrow_nid type card bank in=b)
+limit_base(keep=borrow_nid type card consume_limit usable_consume_limit cash_limit usable_cash_limit in=c);
+by borrow_nid type card;
+if a and b;
+run;
+/*账单月层转卡层,最早账单月,最近账单月*/
+/*按card_id,账单月去重*/
+proc sort data=bills_base;by borrow_nid type bank card descending bill_date;run;
+data bill_month;
+set bills_base;
+where type="信用卡";
+by borrow_nid type bank card descending bill_date;
+retain payment_1-payment_12 least_payment_1-least_payment_12 lst_bill_mth first_bill_mth bill_card_age;
+array a payment_1-payment_12;
+array b least_payment_1-least_payment_12;
+if first.card then do;
+	lst_bill_mth=.;
+	first_bill_mth=.;
+	do i=1 to 12;
+		a(i)=.;
+		b(i)=.;	
+	end;
+end;
+if first.card then lst_bill_mth=compress(substr(bill_date,1,7),"-")+0;
+if last.card then first_bill_mth=compress(substr(bill_date,1,7),"-")+0;
+j=intck("month",input(compress(bill_date),yymmdd10.),input(compress(substr(add_time,1,10)),yymmdd10.));
+if 1<=j<=12 then do;
+	a(j)=compress(payment,"-.",'dk')+0;
+	b(j)=compress(least_payment,"-.",'dk')+0;
+end;
+drop id
+begin_date
+end_date
+bill_date
+repay_date
+payment
+least_payment
+dt;
+do i=1 to 12;
+	if a(i)=. then a(i)=.;
+	if b(i)=. then b(i)=.;
+end;
+if last.card then do;
+	bill_card_age=intck("month",input(compress(bill_date),yymmdd10.),input(compress(substr(add_time,1,10)),yymmdd10.));	
+	output;
+end;
+run;
+/*卡层转用户层*/
+data bill_user;
+set bill_month;
+by borrow_nid;
+retain user_payment_1-user_payment_12 user_least_payment_1-user_least_payment_12 user_lst_bill_mth user_first_bill_mth
+user_oldest_card_age user_newest_card_age;
+array a payment_1-payment_12;
+array b least_payment_1-least_payment_12;
+array a1 user_payment_1-user_payment_12;
+array b1 user_least_payment_1-user_least_payment_12;
+if first.borrow_nid then do;
+	user_lst_bill_mth=lst_bill_mth;
+	user_first_bill_mth=first_bill_mth;
+	user_oldest_card_age=bill_card_age;
+	user_newest_card_age=bill_card_age;
+	do i=1 to 12;
+		a1(i)=.;
+		b1(i)=.;
+	end;
+end;
+user_lst_bill_mth=max(user_lst_bill_mth,lst_bill_mth);
+user_first_bill_mth=min(user_first_bill_mth,first_bill_mth);
+user_oldest_card_age=max(bill_card_age,user_oldest_card_age);
+user_newest_card_age=min(bill_card_age,user_newest_card_age);
+do i=1 to 12;
+	if a(i)^=. then a1(i)=sum(a1(i),a(i));
+	if b(i)^=. then b1(i)=sum(b1(i),b(i));
+end;
+drop payment_1-payment_12 least_payment_1-least_payment_12 lst_bill_mth first_bill_mth bill_card_age i;
+if last.borrow_nid then do;
+	output;
+end;
+run;
+/*账单变量*/
+proc sort data=limit_var;by borrow_nid;run;
+data bill_var;
+merge bill_user(in=a) limit_var(keep=borrow_nid credit_limit_total in=b);
+by borrow_nid;
+if a;
+array a1 user_payment_1-user_payment_12;
+array b1 user_least_payment_1-user_least_payment_12;
+/*帐龄类*/
+bill_age_max=user_oldest_card_age;
+bill_age_min=user_newest_card_age;
+/*账单类*/
+bill_new=user_lst_bill_mth;
+if length(compress(bill_new))>=6 then 
+lst_billmth_interval=intck("month",input(compress(bill_new),yymmn6.),input(compress(substr(add_time,1,10)),yymmdd10.));
+/*额度使用率类*/
+array l1 limit_use_mth1-limit_use_mth12;
+array g1 amount_flag1-amount_flag12;
+array j1 cum_amount_flag1-cum_amount_flag12;
+do i=1 to 12;
+	if credit_limit_total>0 and a1(i)>=0 then do;
+		l1(i)=max(a1(i),0)/credit_limit_total;
+		g1(i)=1;
+	end;
+	else do;
+		g1(i)=0;
+		l1(i)=.;
+	end;
+	if i=1 then j1(i)=g1(i);
+	else j1(i)=j1(i-1)+g1(i);
+end;
+array k1 bill_limit_use_pre bill_limit_use_pre3 bill_limit_use_pre6 bill_limit_use_pre12;
+array m1 bill_limit_use_pre_max bill_limit_use_pre_max3 bill_limit_use_pre_max6 bill_limit_use_pre_max12;
+array n1 bill_limit_use_pre_month bill_limit_use_pre_month3 bill_limit_use_pre_month6 bill_limit_use_pre_month12;
+array o1 bill_limit_use_over_month bill_limit_use_over_month3 bill_limit_use_over_month6 bill_limit_use_over_month12;
+bill_limit_use_pre_mth_std3=std(of limit_use_mth1-limit_use_mth3);
+bill_limit_use_pre_mth_std6=std(of limit_use_mth1-limit_use_mth6);
+bill_limit_use_pre_mth_std9=std(of limit_use_mth1-limit_use_mth12);
+j=1;
+do i=1,3,6,12;
+	if j1(i)<1 then do;
+		k1(j)=.;
+		m1(j)=.;
+		n1(j)=.;
+		o1(j)=.;
+	end;
+	else do;
+		k1(j)=0;
+		m1(j)=0;
+		n1(j)=0;
+		o1(j)=0;
+	end;
+	if j1(i)>=1 then do;
+		do h=1 to i;
+			k1(j)=sum(k1(j),a1(h));
+			m1(j)=max(m1(j),l1(h));
+			if l1(h)>=0.75 then n1(j)=sum(n1(j),1);
+			if l1(h)>=0.90 then o1(j)=sum(o1(j),1);
+		end;
+		k1(j)=k1(j)/j1(i)/credit_limit_total;
+	end;
+	j+1;
+end;
+drop user_payment_1-user_payment_12 user_least_payment_1-user_least_payment_12
+amount_flag1-amount_flag12 cum_amount_flag1-cum_amount_flag12;
+run;
+/*流水表*/
+data flows;
+set hive.tmp_lp_fushu_flows_new_unique;
+run;
+/*%BIG_DATA_SORT(flows,flows1,borrow_nid loginaccount account_id,10,i);*/
+proc sort data=flows;by borrow_nid type card;run;
+data flow_base;
+merge flows(in=a) account_unique(keep=borrow_nid type card in=b)
+limit_base(keep=borrow_nid type card consume_limit usable_consume_limit cash_limit usable_cash_limit in=c);
+by borrow_nid type card;
+if a and b;
+run;
+/*流水表次数类变量*/
+data flow_mth;
+set flow_base(rename=(settle_amount=settle_amount_t));
+by borrow_nid;
+retain flow_money_pay_cnt1-flow_money_pay_cnt12 flow_income_cnt1-flow_income_cnt12
+flow_is_bill_interest1-flow_is_bill_interest12 flow_is_staging1-flow_is_staging12
+flow_money_atm1-flow_money_atm12 flow_money_atm_cnt1-flow_money_atm_cnt12
+flow_over500_cnt1-flow_over500_cnt12 flow_over1000_cnt1-flow_over1000_cnt12
+flow_late_fee_cnt1-flow_late_fee_cnt12 lst_tran_time
+flow_income_amount1-flow_income_amount12 flow_late_fee_amount1-flow_late_fee_amount12
+flow_repay_amount1-flow_repay_amount12
+flow_salary_cnt1-flow_salary_cnt12 flow_salary_amount1-flow_salary_amount12 flow_flag1-flow_flag12
+flow_debit_balance1-flow_debit_balance12 flow_debit_cnt1-flow_debit_cnt12
+flow_credit_consume_amount1-flow_credit_consume_amount12 flow_credit_inflow_amount1-flow_credit_inflow_amount12
+flow_credit_xj_fenqi_amount1-flow_credit_xj_fenqi_amount12 flow_credit_xf_fenqi_amount1-flow_credit_xf_fenqi_amount12
+flow_credit_zd_fenqi_amount1-flow_credit_zd_fenqi_amount12;
+array a flow_money_pay_cnt1-flow_money_pay_cnt12;/*消费笔数*/
+array b flow_income_cnt1-flow_income_cnt12;/*收入笔数*/
+array c flow_is_bill_interest1-flow_is_bill_interest12;/*利息笔数*/
+array d flow_is_staging1-flow_is_staging12;/*分期笔数*/
+array e flow_money_atm1-flow_money_atm12;/*取现金额*/
+array f flow_money_atm_cnt1-flow_money_atm_cnt12;/*取现笔数*/
+array g flow_over500_cnt1-flow_over500_cnt12;/*消费>=500笔数*/
+array h flow_over1000_cnt1-flow_over1000_cnt12;/*消费>=1000笔数*/
+array k flow_late_fee_cnt1-flow_late_fee_cnt12;/*滞纳金笔数*/
+array l flow_income_amount1-flow_income_amount12;/*收入金额*/
+array m flow_late_fee_amount1-flow_late_fee_amount12;/*滞纳金金额*/
+array n flow_repay_amount1-flow_repay_amount12;/*还款金额*/
+array o flow_salary_amount1-flow_salary_amount12;/*工资金额*/
+array p flow_salary_cnt1-flow_salary_cnt12;/*工资笔数*/
+array q flow_flag1-flow_flag12;/*有记录标记*/
+array r flow_debit_balance1-flow_debit_balance12;/*储蓄卡余额和*/
+array s flow_debit_cnt1-flow_debit_cnt12;/*储蓄卡余额笔数*/
+array t flow_credit_consume_amount1-flow_credit_consume_amount12;/*信用卡消费金额*/
+array u flow_credit_inflow_amount1-flow_credit_inflow_amount12;/*信用卡流入金额*/
+array v flow_credit_xj_fenqi_amount1-flow_credit_xj_fenqi_amount12;/*信用卡现金分期金额*/
+array w flow_credit_xf_fenqi_amount1-flow_credit_xf_fenqi_amount12;/*信用卡消费分期金额*/
+array x flow_credit_zd_fenqi_amount1-flow_credit_zd_fenqi_amount12;/*信用卡账单分期金额*/
+if first.borrow_nid then do;
+	lst_tran_time=.;
+	do i=1 to 12;
+		a(i)=.;
+		b(i)=.;
+		c(i)=.;
+		d(i)=.;
+		e(i)=.;
+		f(i)=.;
+		g(i)=.;
+		h(i)=.;
+		k(i)=.;
+		l(i)=.;
+		m(i)=.;
+		n(i)=.;
+		o(i)=.;
+		p(i)=.;
+		q(i)=.;
+		r(i)=.;
+		s(i)=.;
+		t(i)=.;
+		u(i)=.;
+		v(i)=.;
+		w(i)=.;
+		x(i)=.;
+	end;
+end;
+/*j=intck("month",input(compress(substr(settle_time,1,10),"-"),yymmdd8.),input(compress(substr(add_time,1,10),"-"),yymmdd8.));*/
+j1=intck("day",input(compress(substr(settle_time,1,10),"-"),yymmdd8.),input(compress(substr(add_time,1,10),"-"),yymmdd8.));
+j=round(j1/30)+1;
+lst_tran_time=max(compress(substr(settle_time,1,10),"-")+0,lst_tran_time);
+settle_amount=compress(settle_amount_t)+0;
+if 1<=j<=12 then do;
+	q(j)=sum(q(j),1);
+	if type="储蓄卡" and compress(balance)^="" then do;
+		r(j)=sum(r(j),compress(balance)+0);
+		s(j)=sum(s(j),1);
+	end;
+	if settle_amount>0 and type="信用卡" then do;
+		a(j)=sum(a(j),1);
+		t(j)=sum(t(j),settle_amount);
+	end;
+	if settle_amount<0 and type="信用卡" then do;
+		u(j)=sum(u(j),abs(settle_amount));
+	end;
+/*	if settle_amount<0 and type="信用卡" and (index(summary,"还款")>0 or index(postscript,"还款")>0 */
+/*or index(trade_description,"还款")>0)*/
+/*		then u(j)=sum(u(j),-(settle_amount));*/
+	if type="储蓄卡" and settle_amount<0 then do;
+		l(j)=sum(l(j),-(settle_amount));
+		b(j)=sum(b(j),1);
+	end;
+	if settle_amount>=0 and type="信用卡" and (index(summary,"利息")>0 or index(postscript,"利息")>0 or index(trade_description,"利息")>0) 
+		then c(j)=sum(c(j),1);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"分期")>0 or index(postscript,"分期")>0 or index(trade_description,"分期")>0)  
+		then d(j)=sum(d(j),1);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"现金分期")>0 or index(postscript,"现金分期")>0 
+or index(trade_description,"现金分期")>0)  
+		then v(j)=sum(v(j),settle_amount);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"消费分期")>0 or index(postscript,"消费分期")>0 
+or index(trade_description,"消费分期")>0)  
+		then w(j)=sum(w(j),settle_amount);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"账单分期")>0 or index(postscript,"账单分期")>0 
+or index(trade_description,"账单分期")>0)  
+		then x(j)=sum(x(j),settle_amount);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"取现")>0 or index(postscript,"取现")>0 or index(trade_description,"取现")>0
+	or index(upcase(summary),"ATM")>0 or index(upcase(postscript),"ATM")>0 or index(upcase(trade_description),"ATM")>0
+	or index(upcase(summary),"预借现金")>0 or index(upcase(postscript),"预借现金")>0 or index(upcase(trade_description),"预借现金")>0) 
+		then e(j)=sum(e(j),settle_amount);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"取现")>0 or index(postscript,"取现")>0 or index(trade_description,"取现")>0
+	or index(upcase(summary),"ATM")>0 or index(upcase(postscript),"ATM")>0 or index(upcase(trade_description),"ATM")>0
+	or index(upcase(summary),"预借现金")>0 or index(upcase(postscript),"预借现金")>0 or index(upcase(trade_description),"预借现金")>0)
+	and  (index(summary,"费")=0 or index(postscript,"费")=0 or index(trade_description,"费")=0) then f(j)=sum(f(j),1);
+	if settle_amount>=500 and type="信用卡" then g(j)=sum(g(j),1);
+	if settle_amount>=1000 and type="信用卡" then h(j)=sum(h(j),1);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"滞纳")>0 or index(postscript,"滞纳")>0 or index(trade_description,"滞纳")>0
+or index(summary,"违约")>0 or index(postscript,"违约")>0 or index(trade_description,"违约")>0
+or index(summary,"罚")>0 or index(postscript,"罚")>0 or index(trade_description,"罚")>0) 
+		then k(j)=sum(k(j),1);
+	if settle_amount>=0 and type="信用卡" and (index(summary,"滞纳")>0 or index(postscript,"滞纳")>0 or index(trade_description,"滞纳")>0
+or index(summary,"违约")>0 or index(postscript,"违约")>0 or index(trade_description,"违约")>0
+or index(summary,"罚")>0 or index(postscript,"罚")>0 or index(trade_description,"罚")>0)   
+		then m(j)=sum(m(j),(compress(settle_amount)+0));
+		if settle_amount<0 and type="信用卡" and (index(summary,"还款")>0 or index(postscript,"还款")>0 
+or index(trade_description,"还款")>0)
+		then n(j)=sum(n(j),-(settle_amount));
+		if settle_amount<0 and type="储蓄卡" and (index(summary,"工资")>0 or index(postscript,"工资")>0 
+or index(trade_description,"工资")>0)
+		then o(j)=sum(o(j),-(settle_amount));
+		if settle_amount<0 and type="储蓄卡" and (index(summary,"工资")>0 or index(postscript,"工资")>0 
+or index(trade_description,"工资")>0)
+		then p(j)=sum(p(j),1);
+end;
+drop 
+trade_time
+settle_time
+trade_amount
+trade_amount_rmb
+trade_currency
+settle_amount
+settle_amount_rmb
+settle_currency
+balance
+account_no
+trade_description
+trade_nation
+trade_place
+trade_channel
+oppesite_name
+oppesite_bank
+oppesite_account
+summary
+postscript
+dt
+i
+j
+;
+if last.borrow_nid then do;
+	do i=1 to 12;
+		if a(i)=. and q(i)^=. then a(i)=0;
+		if b(i)=. and q(i)^=. then b(i)=0;
+		if c(i)=. and q(i)^=. then c(i)=0;
+		if d(i)=. and q(i)^=. then d(i)=0;
+		if e(i)=. and q(i)^=. then e(i)=0;
+		if f(i)=. and q(i)^=. then f(i)=0;
+		if g(i)=. and q(i)^=. then g(i)=0;
+		if h(i)=. and q(i)^=. then h(i)=0;
+		if k(i)=. and q(i)^=. then k(i)=0;
+		if l(i)=. and q(i)^=. then l(i)=0;
+		if m(i)=. and q(i)^=. then m(i)=0;
+		if n(i)=. and q(i)^=. then n(i)=0;
+		if o(i)=. and q(i)^=. then o(i)=0;
+		if p(i)=. and q(i)^=. then p(i)=0;
+		if r(i)=. and q(i)^=. then r(i)=0;
+		if s(i)=. and q(i)^=. then s(i)=0;
+		if t(i)=. and q(i)^=. then t(i)=0;
+		if u(i)=. and q(i)^=. then u(i)=0;
+		if v(i)=. and q(i)^=. then v(i)=0;
+		if w(i)=. and q(i)^=. then w(i)=0;
+		if x(i)=. and q(i)^=. then x(i)=0;
+	end;
+	output;
+end;
+run;
+/*流水表变量*/
+data flow_var;
+set flow_mth;
+by borrow_nid;
+array a flow_money_pay_cnt1-flow_money_pay_cnt12;/*消费笔数*/
+array b flow_income_cnt1-flow_income_cnt12;/*收入笔数*/
+array c flow_is_bill_interest1-flow_is_bill_interest12;/*利息笔数*/
+array d flow_is_staging1-flow_is_staging12;/*分期笔数*/
+array e flow_money_atm1-flow_money_atm12;/*取现金额*/
+array f flow_money_atm_cnt1-flow_money_atm_cnt12;/*取现笔数*/
+array g flow_over500_cnt1-flow_over500_cnt12;/*消费>=500笔数*/
+array h flow_over1000_cnt1-flow_over1000_cnt12;/*消费>=1000笔数*/
+array k flow_late_fee_cnt1-flow_late_fee_cnt12;/*滞纳金笔数*/
+array l flow_income_amount1-flow_income_amount12;/*收入金额*/
+array m flow_late_fee_amount1-flow_late_fee_amount12;/*滞纳金金额*/
+array o flow_salary_amount1-flow_salary_amount12;/*工资金额*/
+array p flow_salary_cnt1-flow_salary_cnt12;/*工资笔数*/
+array q flow_flag1-flow_flag12;/*有记录标记*/
+array r flow_debit_balance1-flow_debit_balance12;/*储蓄卡余额和*/
+array s flow_debit_cnt1-flow_debit_cnt12;/*储蓄卡余额笔数*/
+array t flow_credit_consume_amount1-flow_credit_consume_amount12;/*信用卡消费金额*/
+array u flow_credit_inflow_amount1-flow_credit_inflow_amount12;/*信用卡流入金额*/
+array v flow_credit_xj_fenqi_amount1-flow_credit_xj_fenqi_amount12;/*信用卡现金分期金额*/
+array w flow_credit_xf_fenqi_amount1-flow_credit_xf_fenqi_amount12;/*信用卡消费分期金额*/
+array x flow_credit_zd_fenqi_amount1-flow_credit_zd_fenqi_amount12;/*信用卡账单分期金额*/
+array n2 flow_repay_amount1-flow_repay_amount12;/*还款金额*/
+array a1 money_pay_cnt1 money_pay_cnt3 money_pay_cnt6 money_pay_cnt12;/*消费笔数*/
+array b1 income_cnt1 income_cnt3 income_cnt6 income_cnt12;/*收入笔数*/
+array c1 is_bill_interest1 is_bill_interest3 is_bill_interest6 is_bill_interest12;/*利息笔数*/
+array d1 is_staging1 is_staging3 is_staging6 is_staging12;/*分期笔数*/
+array e1 money_atm1 money_atm3 money_atm6 money_atm12;/*取现金额*/
+array f1 money_atm_cnt1 money_atm_cnt3 money_atm_cnt6 money_atm_cnt12;/*取现笔数*/
+array g1 over500_cnt1 over500_cnt3 over500_cnt6 over500_cnt12;/*消费>=500笔数*/
+array h1 over1000_cnt1 over1000_cnt3 over1000_cnt6 over1000_cnt12;/*消费>=1000笔数*/
+array k1 late_fee_cnt1 late_fee_cnt3 late_fee_cnt6 late_fee_cnt12;/*滞纳金笔数*/
+array l1 income_amount1 income_amount3 income_amount6 income_amount12;/*收入金额*/
+array m1 late_fee_amount1 late_fee_amount3 late_fee_amount6 late_fee_amount12;/*滞纳金金额*/
+array n1 repay_amount1 repay_amount3 repay_amount6 repay_amount12;/*还款金额*/
+array o1 late_fee_month1 late_fee_month3 late_fee_month6 late_fee_month12;/*滞纳金月份数*/
+array o2 salary_amount1 salary_amount3 salary_amount6 salary_amount12;/*工资金额*/
+array p2 salary_cnt1 salary_cnt3 salary_cnt6 salary_cnt12;/*工资笔数*/
+array r1 debit_balance1 debit_balance3 debit_balance6 debit_balance12;/*储蓄卡余额和*/
+array s1 debit_cnt1 debit_cnt3 debit_cnt6 debit_cnt12;/*储蓄卡余额笔数*/
+array r2 debit_balance_avg1 debit_balance_avg3 debit_balance_avg6 debit_balance_avg12;/*储蓄卡平均余额*/
+array t1 credit_consume_amount1 credit_consume_amount3 credit_consume_amount6 credit_consume_amount12;/*信用卡消费金额*/
+array t3 credit_consume_mth1 credit_consume_mth3 credit_consume_mth6 credit_consume_mth12;/*信用卡消费月份*/
+array u1 credit_inflow_amount1 credit_inflow_amount3 credit_inflow_amount6 credit_inflow_amount12;/*信用卡流入金额*/
+array u3 credit_inflow_mth1 credit_inflow_mth3 credit_inflow_mth6 credit_inflow_mth12;/*信用卡流入月份*/
+array t4 credit_repay_pct1 credit_repay_pct3 credit_repay_pct6 credit_repay_pct12;/*信用卡还款强度*/
+/*array t1 debit_mth1 debit_mth13 debit_mth16 debit_mth12;*/
+array t2 debit_salary_mth1 debit_salary_mth3 debit_salary_mth6 debit_salary_mth12;/*储蓄卡有工资的月份数*/
+array u2 debit_income_mth1 debit_income_mth3 debit_income_mth6 debit_income_mth12;/*储蓄卡有流入的月份数*/
+array u4 debit_avg_amount_over100_mth1 debit_avg_amount_over100_mth3 debit_avg_amount_over100_mth6 
+debit_avg_amount_over100_mth12;/*储蓄卡月均余额>=100的月份数*/
+array v1 credit_xj_fenqi_amount1 credit_xj_fenqi_amount3 credit_xj_fenqi_amount6 credit_xj_fenqi_amount12;/*信用卡现金分期金额*/
+array w1 credit_xf_fenqi_amount1 credit_xf_fenqi_amount3 credit_xf_fenqi_amount6 credit_xf_fenqi_amount12;/*信用卡消费分期金额*/
+array x1 credit_zd_fenqi_amount1 credit_zd_fenqi_amount3 credit_zd_fenqi_amount6 credit_zd_fenqi_amount12;/*信用卡账单分期金额*/
+array v2 credit_xj_fenqi_mth1 credit_xj_fenqi_mth3 credit_xj_fenqi_mth6 credit_xj_fenqi_mth12;/*信用卡现金分期月份*/
+array w2 credit_xf_fenqi_mth1 credit_xf_fenqi_mth3 credit_xf_fenqi_mth6 credit_xf_fenqi_mth12;/*信用卡消费分期月份*/
+array x2 credit_zd_fenqi_mth1 credit_zd_fenqi_mth3 credit_zd_fenqi_mth6 credit_zd_fenqi_mth12;/*信用卡账单分期月份*/
+array v3 credit_xj_fenqi_pct1 credit_xj_fenqi_pct3 credit_xj_fenqi_pct6 credit_xj_fenqi_pct12;/*信用卡现金分期消费占比*/
+array w3 credit_xf_fenqi_pct1 credit_xf_fenqi_pct3 credit_xf_fenqi_pct6 credit_xf_fenqi_pct12;/*信用卡消费分期消费占比*/
+array x3 credit_zd_fenqi_pct1 credit_zd_fenqi_pct3 credit_zd_fenqi_pct6 credit_zd_fenqi_pct12;/*信用卡账单分期消费占比*/
+drop flow_money_pay_cnt1-flow_money_pay_cnt12 
+flow_is_bill_interest1-flow_is_bill_interest12 flow_is_staging1-flow_is_staging12
+flow_money_atm1-flow_money_atm12 flow_money_atm_cnt1-flow_money_atm_cnt12
+flow_over500_cnt1-flow_over500_cnt12 flow_over1000_cnt1-flow_over1000_cnt12
+flow_late_fee_cnt1-flow_late_fee_cnt12 lst_tran_time
+flow_income_amount1-flow_income_amount12 flow_late_fee_amount1-flow_late_fee_amount12
+flow_income_cnt1-flow_income_cnt12 flow_repay_amount1-flow_repay_amount12
+flow_salary_cnt1-flow_salary_cnt12 flow_salary_amount1-flow_salary_amount12 flow_flag1-flow_flag12
+flow_debit_balance1-flow_debit_balance12 flow_debit_cnt1-flow_debit_cnt12 flow_credit_consume_amount1-flow_credit_consume_amount12
+flow_credit_inflow_amount1-flow_credit_inflow_amount12
+flow_credit_xj_fenqi_amount1-flow_credit_xj_fenqi_amount12 flow_credit_xf_fenqi_amount1-flow_credit_xf_fenqi_amount12
+flow_credit_zd_fenqi_amount1-flow_credit_zd_fenqi_amount12;
+lst_tran_interval=intck("day",input(compress(lst_tran_time),yymmdd8.),input(compress(substr(add_time,1,10),"-"),yymmdd8.));
+j=1;
+do i=1,3,6,12;
+	do n=1 to i;
+		v1(j)=sum(v1(j),v(n));
+		w1(j)=sum(w1(j),w(n));
+		x1(j)=sum(x1(j),x(n));
+		if v(n)>0 then v2(j)=sum(v2(j),1);
+		if w(n)>0 then w2(j)=sum(w2(j),1);
+		if x(n)>0 then x2(j)=sum(x2(j),1);
+		t1(j)=sum(t1(j),t(n));
+		u1(j)=sum(u1(j),u(n));
+		if t(n)>0 then t3(j)=sum(t3(j),1);
+		if u(n)>0 then u3(j)=sum(u3(j),1);
+		if s(n)>0 then do;
+			if r(n)/s(n)>=100 then u4(j)=sum(u4(j),1);
+		end;
+		if k(n)>=1 then o1(j)=sum(o1(j),1);
+		else if a(n)>=0 then o1(j)=sum(o1(j),0);
+		a1(j)=sum(a1(j),a(n));
+		b1(j)=sum(b1(j),b(n));
+		c1(j)=sum(c1(j),c(n));
+		d1(j)=sum(d1(j),d(n));
+		e1(j)=sum(e1(j),e(n));
+		f1(j)=sum(f1(j),f(n));
+		g1(j)=sum(g1(j),g(n));
+		h1(j)=sum(h1(j),h(n));
+		k1(j)=sum(k1(j),k(n));
+		l1(j)=sum(l1(j),l(n));
+		m1(j)=sum(m1(j),m(n));
+		n1(j)=sum(n1(j),n2(n));
+		o2(j)=sum(o2(j),o(n));
+		p2(j)=sum(p2(j),p(n));
+		r1(j)=sum(r1(j),r(n));
+		s1(j)=sum(s1(j),s(n));
+		if p(n)>0 then t2(j)=sum(t2(j),1);
+		if b(n)>0 then u2(j)=sum(u2(j),1);
+	end;
+	if s1(j)>0 then r2(j)=round(r1(j)/s1(j),1);
+	if t1(j)>0 then do;
+		t4(j)=u1(j)/t1(j);
+		v3(j)=v1(j)/t1(j);
+		w3(j)=w1(j)/t1(j);
+		x3(j)=x1(j)/t1(j);
+	end;
+	j+1;
+end;
+run;
+/*所有数据*/
+Proc sort data=Bill_var;by borrow_nid;run;
+Proc sort data=Card_var;by borrow_nid;run;
+/*Proc sort data=Limit_var;by borrow_nid;run;*/
+%inc "&dir\varlist.sas";
+data credit_var;
+merge flow_bill_var(keep=borrow_nid &bill_flow_var in=e) limit_var(keep=borrow_nid &limit_var in=d) Flow_var(keep=borrow_nid &flow_var &new_flow_var &new2 in=c)  
+Bill_var(keep=borrow_nid &bill_var in=b) Card_var(in=a) ;
+by borrow_nid;
+/*信用卡平均额度*/
+if Non_shared_credit_card_num>0 then credit_limit_avg=round(credit_limit_total/Non_shared_credit_card_num,1);
+if a;
+drop &drop_var;
+run;
+data credit_var_new;
+set credit_var;
+array m &limit_var  &flow_var &bill_var &card_var credit_limit_avg &new_flow_var &new2 &bill_flow_var; 
+do i=1 to dim(m);
+	if m(i)=. then m(i)=-9999;
+end;
+if late_days>10 then m3=1;else m3=0;
+target=(m3=0);
+run;
+/*分期*/
+PROC VARclus data=credit_var_new; /* 系统默认使用主成分法聚类 */
+var &limit_var  &flow_var &bill_var &card_var credit_limit_avg &new_flow_var &new2 &bill_flow_var;
+run;
+%inc "&dir./Num_Var_Binning1.sas";
+%Num_Var_Binning_New
+		(	Input_DSN=credit_var_new, 							 	/*input data set name*/
+			Target = m3 , 										/*target binary variables*/
+			InputVar_List =&bill_flow_var/*&limit_var  &flow_var &bill_var &card_var &new_flow_var credit_limit_avg &new2*/, /*input continuous variables list, separated by blanks*/			
+			Max_Missing_Portion =1 , 			/* how big of the  portiton of missing obs out of total obs is allowed; 0~1*/
+			Initial_Bin_Num =30,						/*Inital bin number, recommeded:100 or 50 or 20 or 16 or 8*/
+			Inital_Bin_Method =2 , 					/* Equal Width(Bucket) or Equal Height(quantitle).  1: Equal Width; 2: Equal Height*/
+			Max_Bin_Num =8, 							/*the maximum number of bins are allowed to form, 10~15*/
+			ChiSquare_Sign_Level =0.05 ,				/* signicance level for the independence chi-square test */
+			Info_Value_Threshold =0.02, 				/*  information threshould for variable selection */
+			Output_DSN_Detail =out.DSN_Detail,					/*Output dataset name, detailed info   */
+			Output_DSN_Smry =out.DSN_Smry,					/*Output dataset name, summary info  */
+			Output_DSN_Sel_Detail=out.DSN_Sel_Detail,
+			Output_DSN_Sel_Smry =out.DSN_Sel_Smry,				/*Output dataset name, summary info */
+			output_missing_var=	out.missing_var				/*Output missing_var */
+		);
+proc export data=out.Dsn_sel_smry
+outfile="&dir./temp.xlsx"
+dbms=excel replace;
+sheet="Dsn_sel_smry";
+run;
+proc export data=out.Dsn_sel_detail
+outfile="&dir./temp.xlsx"
+dbms=excel replace;
+sheet="Dsn_sel_detail";
+run;
+proc export data=out.Dsn_smry
+outfile="&dir./temp.xlsx"
+dbms=excel replace;
+sheet="Dsn_smry";
+run;
+proc export data=out.Dsn_detail
+outfile="&dir./temp.xlsx"
+dbms=excel replace;
+sheet="Dsn_detail";
+run;
+proc print data=out.Dsn_smry noobs;run;
+proc print data=out.Dsn_detail noobs;run;
+proc print data=out.Dsn_sel_smry noobs;run;
+proc print data=out.Dsn_sel_detail noobs;run;
+
+proc contents data=credit_var_new varnum;run;
+proc format;
+value salary
+low-<0="00.Missing"
+0-<2000="01.[0,2000)"
+2000-<3000="02.[2000,3000)"
+3000-<5000="03.[3000,5000)"
+5000-<8000="04.[5000,8000)"
+8000-<12000="05.[8000,12000)"
+12000-<15000="06.[12000,15000)"
+15000-<18000="07.[15000,18000)"
+18000-high="08.[18000,+]"
+other="00.Missing"
+;
+run;
+/*收入*/
+%inc "&dir./format.sas";
+data credit_income;
+set credit_var_new(keep=borrow_nid
+credit_limit_max
+credit_limit_total
+credit_limit_min
+credit_limit_avg
+credit_consume_mth3
+debit_avg_amount_over100_mth3
+credit_consume_amount3
+credit_repay_pct3
+credit_inflow_mth3
+credit_inflow_amount3
+debit_balance_avg3
+late_fee_cnt3
+money_atm3
+money_atm_cnt3
+income_amount3
+repay_amount3
+salary_amount3
+debit_cnt3
+bill_limit_use_pre3
+bill_limit_use_pre_max3
+bill_limit_use_pre_month3
+bill_limit_use_over_month3
+user_id
+target
+debit_salary_mth3
+debit_income_mth3
+income_cnt3
+credit_xj_fenqi_amount3
+credit_xf_fenqi_amount3
+credit_zd_fenqi_amount3
+credit_xj_fenqi_mth3
+credit_xf_fenqi_mth3
+credit_zd_fenqi_mth3
+credit_xj_fenqi_pct3
+credit_xf_fenqi_pct3
+credit_zd_fenqi_pct3
+flow_bill_xpayment3
+flow_bill_xflow_amount3
+flow_bill_pay_pct_min3
+flow_bill_pay_pct_avg3
+);
+if money_atm_cnt3>0 then money_atm_pct3=money_atm3/credit_limit_total;
+if debit_salary_mth3>0 then salary_assess=salary_amount3/debit_salary_mth3/100;
+if debit_salary_mth3>0 and debit_salary_mth3=3 then salary_condition=salary_assess;
+if income_cnt3>0 then income_avg_cnt3=round(income_amount3/income_cnt3/100,1);
+if debit_income_mth3>0 then income_avg_mth3=round(income_amount3/debit_income_mth3/100,1);
+if debit_income_mth3=3 then do;
+	income_avg_cnt_condition=income_avg_cnt3;
+	income_avg_mth_condition=income_avg_mth3;
+end;
+credit_limit_assess=(credit_limit_avg/100/3);
+credit_limit_avg_org=(credit_limit_avg/100);
+if bill_limit_use_over_month3=0 and credit_consume_mth3=3 and late_fee_cnt3=0 then do;
+	credit_limit_condition=credit_limit_assess;
+	credit_limit_org_condition=credit_limit_avg_org;
+end;
+if debit_cnt3<=1 then debit_balance_assess=(debit_balance_avg3/100);
+else if debit_cnt3<=5 then debit_balance_assess=(debit_balance_avg3/100)*1.5;
+else debit_balance_assess=(debit_balance_avg3/100)*2;
+debit_balance_org=(debit_balance_avg3/100);
+if debit_avg_amount_over100_mth3=3 then do;
+	debit_balance_avg3_condition=debit_balance_org;
+	debit_balance_assess_condition=debit_balance_assess;
+end;
+run;
+data all_predict_v3;
+merge predict_income_dt(in=a ) credit_income(drop=user_id in=b);
+by borrow_nid;
+if br_dt_new>=0 then dt=br_dt_new;
+else if br_dt_old>=0 then dt=br_dt_old;
+else if als_m3_id_nbank_orgnum>="0" then dt=compress(als_m3_id_nbank_orgnum)+0;
+else dt=compress(al_m3_id_notbank_orgnum)+0;
+dt_band=put(dt,dt.);
+if compress(calc_param)="" then calc_param="1.2";
+if huma_amount>0 then old_amount_result=huma_amount;
+else if calc_amount>0 then old_amount_result=calc_amount;
+else if compress(calc_amount_multi_result)+0>0 then old_amount_result=compress(calc_amount_multi_result)+0;
+else old_amount_result=account;
+if a and b;
+keep borrow_nid calc_param user_id account borrow_period add_channel add_time 
+is_new repay_time late_days channel_category add_mth age income1 edu work_year pred_income
+dt dt_band old_amount_result credit_limit_max
+credit_limit_total
+credit_limit_min
+income_cnt3
+money_atm3
+money_atm_cnt3
+late_fee_cnt3
+income_amount3
+repay_amount3
+salary_amount3
+debit_cnt3
+debit_balance_avg3
+credit_consume_amount3
+credit_consume_mth3
+credit_inflow_amount3
+credit_inflow_mth3
+credit_repay_pct3
+debit_salary_mth3
+debit_income_mth3
+debit_avg_amount_over100_mth3
+bill_limit_use_pre3
+bill_limit_use_pre_max3
+bill_limit_use_pre_month3
+bill_limit_use_over_month3
+credit_limit_avg
+target
+money_atm_pct3
+salary_assess
+salary_condition
+income_avg_cnt3
+income_avg_mth3
+income_avg_cnt_condition
+income_avg_mth_condition
+credit_limit_assess
+credit_limit_condition
+debit_balance_assess
+debit_balance_avg3_condition
+debit_balance_assess_condition
+credit_limit_org_condition
+credit_limit_avg_org
+debit_balance_org
+credit_xj_fenqi_amount3
+credit_xf_fenqi_amount3
+credit_zd_fenqi_amount3
+credit_xj_fenqi_mth3
+credit_xf_fenqi_mth3
+credit_zd_fenqi_mth3
+credit_xj_fenqi_pct3
+credit_xf_fenqi_pct3
+credit_zd_fenqi_pct3
+flow_bill_xpayment3
+flow_bill_xflow_amount3
+flow_bill_pay_pct_min3
+flow_bill_pay_pct_avg3
+
+;
+run;
+proc contents data=all_predict_v3 varnum;run;
+proc export data=all_predict_v3
+outfile="&dir./detail.xlsx"
+dbms=excel replace;
+sheet="sheet1";
+run;
+/*
+data credit_income;
+set credit_var_new(keep=borrow_nid
+credit_limit_max
+credit_limit_total
+credit_limit_min
+credit_limit_avg
+income_cnt6
+money_atm3
+money_atm_cnt3
+income_amount6
+repay_amount3
+salary_amount3
+salary_cnt3
+debit_cnt1
+debit_cnt6
+debit_balance_avg1
+bill_limit_use_pre3
+bill_limit_use_pre_max3
+user_id
+target/*
+borrow_type
+repay_time
+add_time
+add_mth
+late_days
+is_new
+fushu_cre_time
+dlq0
+m1
+income
+city_name edu work_year_band
+*/
+Non_shared_credit_card_num
+credit_card_num
+debit_card_num
+debit_salary_mth3
+debit_income_mth3);
+credit_limit_avg_band=put(credit_limit_avg/100/3,salary.);
+debit_balance_avg1_band=put(debit_balance_avg1/100,salary.);
+if salary_cnt3>0 then do;
+	salary_avg3_band=put(salary_amount3/debit_salary_mth3/100,salary.);
+	salary_avg3=salary_amount3/debit_salary_mth3/100;
+end;
+else do;
+	salary_avg3_band=put(.,salary.);
+	salary_avg3=-9999;
+end;
+if income_cnt6>0 then income_avg6=round(income_amount6//*debit_income_mth6*/income_cnt6/100,1);
+else income_avg6=-9999;
+income_avg6_band=put(income_avg6,salary.);
+credit_limit_assess=(credit_limit_avg/100/3);
+if debit_cnt1<=1 then debit_balance_assess=(debit_balance_avg1/100);
+else if debit_cnt1<=5 then debit_balance_assess=(debit_balance_avg1/100)*1.5;
+else debit_balance_assess=(debit_balance_avg1/100)*2;
+salary_assess=salary_avg3;
+flow_assess=income_avg6;
+run;
